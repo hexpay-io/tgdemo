@@ -1,0 +1,1722 @@
+openapi: 3.0.3
+info:
+  title: HexPay Merchant API
+  description: |
+    HexPay Merchant API for cryptocurrency payment processing on the TON blockchain.
+
+    ## Authentication
+    All API endpoints require authentication via JWT token. Include the token in the
+    `Authorization` header using the Bearer scheme:
+
+    ```
+    Authorization: Bearer <JWT_TOKEN>
+    ```
+
+    ## Naming
+    All JSON fields and parameters use `lowerCamelCase`. Abbreviations are written as
+    regular words: `orderId`, `paymentId`, `checkoutUrl`, `webhookUrl`.
+    Field names are case-sensitive.
+
+    ## Idempotency
+    `POST` requests support an optional `X-Idempotency-Key` header containing a UUID.
+    When provided, the server stores the response for each idempotency key for 24 hours and
+    returns the stored response for any repeated request with the same key, preventing
+    duplicate resources on retry.
+
+    - Generate a fresh key for each logically distinct operation.
+    - Reuse the same key when retrying the same operation.
+    - Responses with status `401`, `403`, `404`, `408`, `409`, `429`, `500`, `502`, `503`
+      or `504` are **not** stored: a retry with the same key is executed again.
+    - Reusing a key with a different request body or endpoint returns `400`
+      with code `idempotency_key_reused`.
+    - A key that is not a valid UUID returns `400` with code `invalid_idempotency_key`.
+
+    ## Payment Lifecycle
+
+    ```
+                                   +----------+
+                                   |          |
+                                   | created  |
+                                   |          |
+                                   +----------+
+                                         |
+          +------------------------------|----------------------------+
+          |                              |                            |
+          |TTL elapsed                   |method selected             |merchant cancels
+          |                              |                            |
+          v                              v                            v
+    +----------+                   +----------+                   +----------+
+    |          |    TTL elapsed    |          | merchant cancels  |          |
+    | expired  |<------------------| pending  |------------------>|cancelled |
+    |          |                   |          |                   |          |
+    +----------+                   +----------+                   +----------+
+                                        |
+                                        |
+                                        |
+                                        |
+                                        |transfer confirmed
+                                        |
+                                        v
+                                   +----------+
+                                   |          |
+                                   |completed |
+                                   |          |
+                                   +----------+
+    ```
+
+    | Status      | Meaning                                                                          |
+    |-------------|----------------------------------------------------------------------------------|
+    | `created`   | Awaiting selection. The invoice has been successfully initialized. The system is waiting for the customer to select a specific coin and network for payment. |
+    | `pending`   | Awaiting payment. The payment method is confirmed, and the exchange rate is locked. A unique deposit address has been generated and is ready to receive funds. |
+    | `completed` | Settled. The payment has been received in full and verified by the blockchain. The order is now eligible for fulfillment and goods can be delivered. |
+    | `expired`   | Timed out. The payment window has closed. No transaction was detected or confirmed on-chain within the required timeframe. |
+    | `cancelled` | Voided. The payment request was revoked by the merchant before any funds were received. |
+
+    ## Payment Creation Modes
+
+    `paymentOptions.methods` is a **restriction**: it limits which payment methods the
+    customer is offered. It is not a search filter.
+
+    ### Preselected
+    Pass `paymentOptions.methods` with **exactly one entry** containing **both** `coin` and
+    `chain`. HexPay selects this method on behalf of the customer, resolves the blockchain
+    address immediately and returns the payment in `pending` status with `paymentDetails`
+    already populated.
+
+    Use this when you want to pin the exact coin and network yourself.
+
+    > Currently only one entry is supported. Restricting the choice to several methods
+    > is planned; until then, more than one entry returns `unsupported_method_filter`.
+
+    ### Customer Choice
+    Omit `paymentOptions` entirely. The customer sees all store-enabled methods on the
+    checkout page and picks one themselves. The payment starts in `created` status.
+
+    Use this when you want to give the customer a choice.
+
+    ## Amount & Denomination
+    The top-level `amount` (string) and `currency` (ticker) fields define the denomination —
+    the value the customer owes and the unit in which it is expressed. `currency` can be a
+    fiat code (`USD`, `EUR`, `RUB`) or a TON-ecosystem coin ticker (`TON`, `USDT`, `NOT`, etc.).
+    It does **not** determine the coin used for payment; that is controlled by
+    `paymentOptions.methods`.
+
+    ## Webhooks
+    If `webhookUrl` is set at creation, HexPay sends **one** `POST` request to it when the
+    payment reaches `completed` status. No webhooks are sent for other statuses
+    (`pending`, `expired`, `cancelled`); use the API to track them.
+
+    Request headers:
+    - `Content-Type: application/json`
+    - `X-Signature` — base64 (standard alphabet, padded) Ed25519 signature of the raw request body.
+    - `X-Signature-Kid` — ID of the key used for signing.
+
+    The body follows the `WebhookRequest` schema:
+
+    ```json
+    {
+      "payload": {
+        "paymentId": "019327c6-2058-7901-b234-56789abcdeff",
+        "status": "completed",
+        "orderId": "order-2026-00123",
+        "metadata": {"customer_id": "cust_abc123"}
+      },
+      "signAt": "2026-01-20T10:12:00Z"
+    }
+    ```
+
+    Verify the signature with the public keys published as a JWKS at
+    `GET https://api.hexpay.io/v1/webhook/keys`. The JWK field `x` is base64url-encoded
+    without padding.
+
+    Delivery:
+    - Any `2xx` response means the webhook is delivered.
+    - Any other status, a network error, or no response within 30 seconds counts as a
+      failure. HexPay retries about every 10 seconds for up to 6 hours, then stops.
+    - The same webhook may arrive more than once. Deduplicate by `paymentId`.
+
+    ## Error Handling
+    All error responses use a consistent envelope format:
+
+    ```json
+    {
+      "error": {
+        "type": "invalid_request_error",
+        "message": "Invalid amount (must be a valid positive number)",
+        "code": "invalid_amount",
+        "param": "amount"
+      }
+    }
+    ```
+
+    The optional `param` field names the specific request field that caused the error.
+
+    ### Error Types
+    | Type                    | HTTP Status | Description                                             |
+    |-------------------------|-------------|---------------------------------------------------------|
+    | `invalid_request_error` | 400         | Request is malformed or contains invalid parameters     |
+    | `authentication_error`  | 401         | Authentication failed or token is invalid / expired     |
+    | `not_found_error`       | 404         | The requested resource does not exist                   |
+    | `rate_limit_error`      | 429         | Concurrent active payment quota exceeded                |
+    | `api_error`             | 500         | An unexpected internal server error occurred            |
+
+    ## Pagination
+    List endpoints use **cursor-based pagination**. Use `limit` to control page size and
+    `cursor` to fetch the next page by passing the `cursor` value from the previous
+    response. When `cursor` is absent, the current page is the last one.
+    Treat the cursor as an opaque string: pass it back unchanged and do not parse it.
+  version: 3.0.0
+
+servers:
+  - url: https://api.hexpay.io
+    description: Production merchant server
+  - url: https://api.demo.hexpay.io
+    description: Production merchant demo server
+
+tags:
+  - name: Payments
+    description: |
+      Create, retrieve, list, and cancel payments.
+      A payment represents a merchant's request to collect a specific amount from a
+      customer via a TON-ecosystem cryptocurrency.
+  - name: Payment Methods
+    description: |
+      Retrieve payment methods (coin + chain combinations) configured and enabled
+      for your store.
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Payments collection
+  # ---------------------------------------------------------------------------
+  /v1/payments:
+    post:
+      tags:
+        - Payments
+      summary: Create a payment
+      description: |
+        Creates a new payment for your store and returns the full payment object.
+
+        ### Denomination
+        Specify the value the customer owes via the top-level `amount` (decimal string)
+        and `currency` (fiat code or coin ticker) fields.
+
+        ---
+
+        ### Preselected
+        Pass `paymentOptions.methods` with **exactly one entry** containing **both** `coin`
+        and `chain`. HexPay selects this method on behalf of the customer, resolves the
+        address immediately and returns the payment in `pending` status with
+        `paymentDetails` populated. The customer proceeds straight to the deposit screen
+        without any method selection step.
+
+        ### Customer Choice
+        Omit `paymentOptions`. All store-enabled payment methods are offered to the customer
+        at checkout. The payment starts in `created` status.
+
+        ---
+
+        ### Supported combinations
+        | `currency` | `paymentOptions.methods`           | Initial status | `paymentDetails` |
+        |------------|------------------------------------|----------------|------------------|
+        | `USD`      | *(omitted)*                        | `created`      | absent           |
+        | `TON`      | *(omitted)*                        | `created`      | absent           |
+        | `USD`      | `[{coin:"USDT",chain:"TON"}]`      | `pending`      | **populated**    |
+        | `TON`      | `[{coin:"USDT",chain:"TON"}]`      | `pending`      | **populated**    |
+        | `TON`      | `[{coin:"TON",chain:"TON"}]`       | `pending`      | **populated**    |
+      operationId: createPayment
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentRequest"
+            examples:
+              fiat_any_method:
+                summary: "$100 USD — customer picks any method"
+                description: |
+                  Minimal fiat payment. No restriction applied — all store-enabled
+                  payment methods are shown to the customer. Payment is created in
+                  `created` status.
+                value:
+                  amount: "100.00"
+                  currency: "USD"
+                  orderId: "order-2026-00123"
+                  webhookUrl: "https://merchant.com/webhooks/hexpay"
+
+              fiat_fast_pending:
+                summary: "$100 USD — USDT on TON"
+                description: |
+                  Preselected mode — coin and chain are both specified, so the payment is created
+                  directly in `pending` status with the deposit address in the response.
+                value:
+                  amount: "100.00"
+                  currency: "USD"
+                  paymentOptions:
+                    methods:
+                      - coin: "USDT"
+                        chain: "TON"
+                  orderId: "order-2026-00124"
+                  webhookUrl: "https://merchant.com/webhooks/hexpay"
+
+              crypto_denomination_fast_pending:
+                summary: "1 TON's worth in USDT"
+                description: |
+                  Preselected mode with crypto denomination — coin and chain are both specified,
+                  so the payment is created directly in `pending` status with the deposit address in the response.
+                value:
+                  amount: "1"
+                  currency: "TON"
+                  paymentOptions:
+                    methods:
+                      - coin: "USDT"
+                        chain: "TON"
+                  orderId: "order-2026-00126"
+                  webhookUrl: "https://merchant.com/webhooks/hexpay"
+
+              full_with_all_fields:
+                summary: Full example with all optional fields
+                description: |
+                  All available request fields including ttl, metadata, description,
+                  and orderId.
+                value:
+                  amount: "250.00"
+                  currency: "USD"
+                  paymentOptions:
+                    methods:
+                      - coin: "USDT"
+                        chain: "TON"
+                  ttl: 1800
+                  orderId: "order-2026-00789"
+                  description: "Premium subscription — 1 year"
+                  metadata:
+                    customer_id: "cust_abc123"
+                    customer_email: "customer@example.com"
+                    plan: "premium_annual"
+                  webhookUrl: "https://merchant.com/webhooks/hexpay"
+                  redirectUrl: "https://merchant.com/orders/order-2026-00789"
+
+      responses:
+        "201":
+          description: |
+            Payment created successfully. Returns the full payment object.
+            Status is `created` unless a single exact method was specified via
+            `paymentOptions.methods`, in which case status is `pending` and
+            `paymentDetails` is already populated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              examples:
+                created_status:
+                  summary: Payment in `created` status
+                  value:
+                    id: "019327c6-2058-7901-b234-56789abcdeff"
+                    status: "created"
+                    orderId: "order-2026-00123"
+                    amount: "100.00"
+                    currency: "USD"
+                    checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                    timer:
+                      createdAt: "2026-01-20T10:00:00Z"
+                      expiresAt: "2026-01-20T11:00:00Z"
+                pending_status:
+                  summary: Payment in `pending` status (exact method pre-specified)
+                  value:
+                    id: "019327c6-2058-7901-b234-56789abcdeff"
+                    status: "pending"
+                    orderId: "order-2026-00124"
+                    amount: "100.00"
+                    currency: "USD"
+                    checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                    paymentDetails:
+                      address: "UQBf_DO8wsBddOcMnGEOyREEHPPKMBL2F26GQFOV7FQdYY_a"
+                      coinAmount: "100.04"
+                      coin:
+                        name: "Tether"
+                        symbol: "USDT"
+                        imgUrl: "https://assets.hexpay.io/coins/usdt.svg"
+                      chain:
+                        name: "TON"
+                        symbol: "TON"
+                        imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                    timer:
+                      createdAt: "2026-01-20T10:00:00Z"
+                      expiresAt: "2026-01-20T11:00:00Z"
+
+        "400":
+          description: The request is invalid or contains conflicting parameters.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_request:
+                  summary: Request body is not valid JSON
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "Request body is not valid JSON"
+                      code: "invalid_request"
+                invalid_amount:
+                  summary: Non-numeric, zero or negative amount
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "Invalid amount (must be a valid positive number)"
+                      code: "invalid_amount"
+                      param: "amount"
+                unsupported_currency:
+                  summary: Unsupported currency code
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "The specified currency is not supported"
+                      code: "unsupported_currency"
+                      param: "currency"
+                unsupported_method_filter:
+                  summary: paymentOptions.methods is not exactly one coin + chain entry
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "This paymentOptions configuration is not yet supported. Use exactly one method with both coin and chain specified, or omit paymentOptions entirely"
+                      code: "unsupported_method_filter"
+                      param: "paymentOptions.methods"
+                method_disabled:
+                  summary: Preselected payment method is disabled
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "Payment method disabled"
+                      code: "payment_method_disabled"
+                no_methods:
+                  summary: Store has no enabled payment methods
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "No payment methods available. Please configure payment methods for your store to create payments"
+                      code: "no_payment_methods"
+                invalid_ttl:
+                  summary: TTL out of allowed range
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "ttl must be between 900 and 43200 seconds"
+                      code: "invalid_ttl"
+                      param: "ttl"
+                invalid_order_id:
+                  summary: orderId too long
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "orderId must not exceed 128 characters"
+                      code: "invalid_order_id"
+                      param: "orderId"
+                invalid_description:
+                  summary: description too long
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "description must not exceed 512 characters"
+                      code: "invalid_description"
+                      param: "description"
+                invalid_metadata:
+                  summary: metadata exceeds limits
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "metadata must not contain more than 10 keys"
+                      code: "invalid_metadata"
+                      param: "metadata"
+                invalid_webhook_url:
+                  summary: webhookUrl is not HTTPS or points to a non-public address
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "webhookUrl must not point to a private or loopback address"
+                      code: "invalid_webhook_url"
+                      param: "webhookUrl"
+                invalid_redirect_url:
+                  summary: redirectUrl is not an absolute HTTPS URL or is too long
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "redirectUrl must be an absolute HTTPS URL"
+                      code: "invalid_redirect_url"
+                      param: "redirectUrl"
+                invalid_idempotency_key:
+                  summary: X-Idempotency-Key is not a valid UUID
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "X-Idempotency-Key must be a valid UUID"
+                      code: "invalid_idempotency_key"
+                      param: "X-Idempotency-Key"
+                idempotency_key_reused:
+                  summary: X-Idempotency-Key reused with different request data
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "Idempotency key was already used with different request data"
+                      code: "idempotency_key_reused"
+                      param: "X-Idempotency-Key"
+
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+        "404":
+          description: The preselected payment method is not enabled for your store.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  type: "not_found_error"
+                  message: "Payment method not found"
+                  code: "payment_method_not_found"
+
+        "429":
+          description: Concurrent active payment quota exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                concurrent_limit:
+                  summary: Concurrent payment limit exceeded
+                  value:
+                    error:
+                      type: "rate_limit_error"
+                      message: "Payment concurrent limit exceeded"
+                      code: "payment_concurrent_limit_exceeded"
+
+        "500":
+          description: An unexpected internal server error occurred.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                internal_error:
+                  summary: Unexpected error
+                  value:
+                    error:
+                      type: "api_error"
+                      message: "Internal server error"
+                      code: "internal_error"
+                zero_exchange_rate:
+                  summary: Exchange rate is temporarily unavailable
+                  value:
+                    error:
+                      type: "api_error"
+                      message: "Exchange rate cannot be zero"
+                      code: "zero_exchange_rate"
+
+    get:
+      tags:
+        - Payments
+      summary: List payments
+      description: |
+        Returns a paginated list of payments for your store, ordered by creation date
+        (most recent first).
+
+        Use cursor-based pagination: if the response contains a `cursor` field, pass
+        its value as the `cursor` query parameter to fetch the next page. The absence of
+        `cursor` in the response means there are no more pages.
+
+        Use the `status` parameter to filter payments by one or more statuses.
+      operationId: listPayments
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum number of payment objects to return per page.
+            Accepts values between 1 and 100. Defaults to 10.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+            example: 20
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            Pagination cursor. Pass the value of `cursor` from the previous
+            response unchanged to retrieve the next page of results.
+            The cursor is an opaque string; do not parse or construct it.
+          schema:
+            type: string
+            example: "019327c6-1234-7901-b234-56789abcde00"
+        - name: status
+          in: query
+          required: false
+          description: |
+            Filter payments by status. Accepts a comma-separated list of statuses.
+            Returns payments matching **any** of the provided values.
+            Omit to return payments in all statuses.
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/PaymentStatus"
+            example:
+              - pending
+              - completed
+          style: form
+          explode: false
+      responses:
+        "200":
+          description: A paginated list of payments.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentListResponse"
+              examples:
+                with_results:
+                  summary: Page with results (more pages available)
+                  value:
+                    data:
+                      - id: "019327c6-2058-7901-b234-56789abcdeff"
+                        status: "completed"
+                        orderId: "order-2026-00123"
+                        amount: "100.00"
+                        currency: "USD"
+                        checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                        timer:
+                          createdAt: "2026-01-20T10:00:00Z"
+                          expiresAt: "2026-01-20T11:00:00Z"
+                          paidAt: "2026-01-20T10:12:00Z"
+                      - id: "019327c6-1234-7901-b234-56789abcde00"
+                        status: "pending"
+                        orderId: "order-2026-00124"
+                        amount: "50.00"
+                        currency: "EUR"
+                        checkoutUrl: "https://payment.hexpay.io/019327c6-1234-7901-b234-56789abcde00"
+                        timer:
+                          createdAt: "2026-01-20T09:30:00Z"
+                          expiresAt: "2026-01-20T10:30:00Z"
+                    cursor: "019327c6-1234-7901-b234-56789abcde00"
+                empty:
+                  summary: No payments found
+                  value:
+                    data: []
+                last_page:
+                  summary: Last page (no more results)
+                  value:
+                    data:
+                      - id: "019327c6-2058-7901-b234-56789abcdeff"
+                        status: "completed"
+                        orderId: "order-2026-00123"
+                        amount: "100.00"
+                        currency: "USD"
+                        checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                        timer:
+                          createdAt: "2026-01-20T10:00:00Z"
+                          expiresAt: "2026-01-20T11:00:00Z"
+                          paidAt: "2026-01-20T10:12:00Z"
+
+        "400":
+          description: One or more query parameters are invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_limit:
+                  summary: limit out of allowed range
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "limit must be between 1 and 100"
+                      code: "invalid_limit"
+                      param: "limit"
+                invalid_cursor:
+                  summary: cursor cannot be decoded
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "cursor is malformed or has expired"
+                      code: "invalid_cursor"
+                      param: "cursor"
+                invalid_status:
+                  summary: unknown status value
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "unknown status value: 'unknown_status'"
+                      code: "invalid_status"
+                      param: "status"
+                invalid_len_status:
+                  summary: status list length out of allowed range
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "status list length must be between 1 and 10"
+                      code: "invalid_status"
+                      param: "status"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Single payment
+  # ---------------------------------------------------------------------------
+  /v1/payments/{paymentId}:
+    get:
+      tags:
+        - Payments
+      summary: Retrieve a payment
+      description: |
+        Retrieves the full details of a payment by its unique identifier.
+
+        The response structure varies by status:
+        - **`created`** — `amount`, `currency` and timer are present.
+          `paymentDetails` is absent — the customer has not yet selected a payment method.
+        - **`pending`** — `paymentDetails` is populated with the blockchain address and
+          exact coin amount. The customer must send the transfer.
+        - **`completed`** — `paymentDetails` includes `transactionSignatures` confirming
+          the on-chain transfer.
+        - **`expired`** — Elapsed TTL. Reachable from both `created` and `pending`.
+          `paymentDetails` is present only if the payment had reached `pending` first.
+        - **`cancelled`** — Canceled by the merchant. Reachable from both `created` and
+          `pending`. `paymentDetails` is present only if the payment had reached `pending`.
+      operationId: getPayment
+      parameters:
+        - $ref: "#/components/parameters/PaymentID"
+      responses:
+        "200":
+          description: Payment details retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              examples:
+                created:
+                  summary: created — awaiting method selection
+                  description: Payment created; customer has not yet selected a payment method.
+                  value:
+                    id: "019327c6-2058-7901-b234-56789abcdeff"
+                    status: "created"
+                    orderId: "order-2026-00123"
+                    amount: "100.00"
+                    currency: "USD"
+                    checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                    metadata:
+                      customer_id: "cust_abc123"
+                    timer:
+                      createdAt: "2026-01-20T10:00:00Z"
+                      expiresAt: "2026-01-20T11:00:00Z"
+                pending:
+                  summary: pending — awaiting on-chain transfer
+                  description: |
+                    Method confirmed. Address is assigned; customer must send the transfer.
+                  value:
+                    id: "019327c6-2058-7901-b234-56789abcdeff"
+                    status: "pending"
+                    orderId: "order-2026-00123"
+                    amount: "100.00"
+                    currency: "USD"
+                    checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                    metadata:
+                      customer_id: "cust_abc123"
+                    paymentDetails:
+                      address: "UQBf_DO8wsBddOcMnGEOyREEHPPKMBL2F26GQFOV7FQdYY_a"
+                      coinAmount: "100.04"
+                      coin:
+                        name: "Tether"
+                        symbol: "USDT"
+                        imgUrl: "https://assets.hexpay.io/coins/usdt.svg"
+                      chain:
+                        name: "TON"
+                        symbol: "TON"
+                        imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                    timer:
+                      createdAt: "2026-01-20T10:00:00Z"
+                      expiresAt: "2026-01-20T11:00:00Z"
+                completed:
+                  summary: completed — on-chain transfer confirmed
+                  description: Payment confirmed; transactionSignatures are present.
+                  value:
+                    id: "019327c6-2058-7901-b234-56789abcdeff"
+                    status: "completed"
+                    orderId: "order-2026-00123"
+                    amount: "100.00"
+                    currency: "USD"
+                    checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+                    metadata:
+                      customer_id: "cust_abc123"
+                    paymentDetails:
+                      address: "UQBf_DO8wsBddOcMnGEOyREEHPPKMBL2F26GQFOV7FQdYY_a"
+                      coinAmount: "100.04"
+                      coin:
+                        name: "Tether"
+                        symbol: "USDT"
+                        imgUrl: "https://assets.hexpay.io/coins/usdt.svg"
+                      chain:
+                        name: "TON"
+                        symbol: "TON"
+                        imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                      transactionSignatures:
+                        - "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+                    timer:
+                      createdAt: "2026-01-20T10:00:00Z"
+                      expiresAt: "2026-01-20T11:00:00Z"
+                      paidAt: "2026-01-20T10:12:00Z"
+                expired_from_created:
+                  summary: expired — TTL elapsed before method selection
+                  description: |
+                    Payment expired while still in `created` status. No paymentDetails.
+                  value:
+                    id: "019327c6-2058-7901-b234-56789abcde01"
+                    status: "expired"
+                    orderId: "order-2026-00125"
+                    amount: "75.00"
+                    currency: "USD"
+                    checkoutUrl: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcde01"
+                    timer:
+                      createdAt: "2026-01-20T10:00:00Z"
+                      expiresAt: "2026-01-20T11:00:00Z"
+        "400":
+          $ref: "#/components/responses/InvalidPaymentID"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/PaymentNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Payment status (lightweight polling)
+  # ---------------------------------------------------------------------------
+  /v1/payments/{paymentId}/status:
+    get:
+      tags:
+        - Payments
+      summary: Retrieve payment status
+      description: |
+        Returns only the current status of a payment. Use this lightweight endpoint
+        for high-frequency polling where you only need to detect status changes
+        without the overhead of fetching the full payment object.
+
+      operationId: getPaymentStatus
+      parameters:
+        - $ref: "#/components/parameters/PaymentID"
+      responses:
+        "200":
+          description: Payment status retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentStatusResponse"
+              examples:
+                created:
+                  summary: Awaiting method selection
+                  value:
+                    status: "created"
+                pending:
+                  summary: Awaiting on-chain transfer
+                  value:
+                    status: "pending"
+                completed:
+                  summary: Payment confirmed on-chain
+                  value:
+                    status: "completed"
+                expired:
+                  summary: Payment TTL elapsed
+                  value:
+                    status: "expired"
+                cancelled:
+                  summary: Canceled by merchant
+                  value:
+                    status: "cancelled"
+        "400":
+          $ref: "#/components/responses/InvalidPaymentID"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/PaymentNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Cancel payment (state-changing action → POST, not DELETE)
+  # ---------------------------------------------------------------------------
+  /v1/payments/{paymentId}/cancel:
+    post:
+      tags:
+        - Payments
+      summary: Cancel a payment
+      description: |
+        Cancels a payment. The response contains only the new status, `cancelled`.
+        Use `GET /v1/payments/{paymentId}` if you need the full payment object.
+
+        Cancellation is permitted from `created` or `pending` status only. Payments
+        already in a terminal state (`completed`, `expired`, or `cancelled`) cannot
+        be cancelled.
+
+      operationId: cancelPayment
+      parameters:
+        - $ref: "#/components/parameters/PaymentID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: |
+            Payment cancelled successfully. Only the status is returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentCancelResponse"
+              example:
+                status: "cancelled"
+        "400":
+          description: The request is invalid or the payment cannot be cancelled in its current state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_payment_id:
+                  summary: paymentId is not a valid UUID
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "paymentId must be a valid UUID"
+                      code: "invalid_payment_id"
+                      param: "paymentId"
+                payment_not_cancellable:
+                  summary: Payment is in a terminal state
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "Payment cannot be cancelled in current status"
+                      code: "payment_not_cancellable"
+                invalid_idempotency_key:
+                  summary: X-Idempotency-Key is not a valid UUID
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "X-Idempotency-Key must be a valid UUID"
+                      code: "invalid_idempotency_key"
+                      param: "X-Idempotency-Key"
+                idempotency_key_reused:
+                  summary: X-Idempotency-Key reused with different request data
+                  value:
+                    error:
+                      type: "invalid_request_error"
+                      message: "Idempotency key was already used with different request data"
+                      code: "idempotency_key_reused"
+                      param: "X-Idempotency-Key"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/PaymentNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Payment methods
+  # ---------------------------------------------------------------------------
+  /v1/payment-methods:
+    get:
+      tags:
+        - Payment Methods
+      summary: List payment methods
+      description: |
+        Retrieves the payment methods enabled for your store. Each entry represents
+        a unique coin + chain combination that your store accepts. Use it, for example,
+        to show available payment options on your website.
+
+        Only your store's enabled methods are returned, not every coin supported by
+        HexPay.
+
+        Use `coin.symbol` and `chain.symbol` values from this response as inputs for
+        the `coin` and `chain` fields in `paymentOptions.methods` when creating a payment.
+      operationId: listPaymentMethods
+      responses:
+        "200":
+          description: Payment methods retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentMethodListResponse"
+              examples:
+                store_methods:
+                  summary: Store with multiple enabled TON methods
+                  value:
+                    data:
+                      - id: "0197ef69-6825-7bb4-8cd8-770ab407e240"
+                        coin:
+                          name: "Toncoin"
+                          symbol: "TON"
+                          imgUrl: "https://assets.hexpay.io/coins/ton.svg"
+                        chain:
+                          name: "TON"
+                          symbol: "TON"
+                          imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                      - id: "0197ef69-8297-72d3-94fb-50472539a1c8"
+                        coin:
+                          name: "Tether"
+                          symbol: "USDT"
+                          imgUrl: "https://assets.hexpay.io/coins/usdt.svg"
+                        chain:
+                          name: "TON"
+                          symbol: "TON"
+                          imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                      - id: "0197ef69-98b6-72d4-81a6-6b884fb674c2"
+                        coin:
+                          name: "Notcoin"
+                          symbol: "NOT"
+                          imgUrl: "https://assets.hexpay.io/coins/not.svg"
+                        chain:
+                          name: "TON"
+                          symbol: "TON"
+                          imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                      - id: "0197ef6a-3ffd-7ed1-8859-aeb815142b33"
+                        coin:
+                          name: "Dogs"
+                          symbol: "DOGS"
+                          imgUrl: "https://assets.hexpay.io/coins/dogs.svg"
+                        chain:
+                          name: "TON"
+                          symbol: "TON"
+                          imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+                      - id: "0198b81f-4caf-72a3-a849-75b6c9bdad3e"
+                        coin:
+                          name: "Blum"
+                          symbol: "BLUM"
+                          imgUrl: "https://assets.hexpay.io/coins/blum.svg"
+                        chain:
+                          name: "TON"
+                          symbol: "TON"
+                          imgUrl: "https://assets.hexpay.io/chains/ton.svg"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+# =============================================================================
+# Security
+# =============================================================================
+security:
+  - apiAuth: []
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+  # ---------------------------------------------------------------------------
+  # Security schemes
+  # ---------------------------------------------------------------------------
+  securitySchemes:
+    apiAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT token signed with the EdDSA algorithm. Obtain the token from the HexPay
+        merchant dashboard and pass it via the `Authorization: Bearer <token>` header.
+
+  # ---------------------------------------------------------------------------
+  # Reusable parameters
+  # ---------------------------------------------------------------------------
+  parameters:
+    IdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Optional UUID key for idempotent request processing. If the server receives
+        two requests with the same key within a 24-hour window, the second returns
+        the stored response from the first without creating a duplicate resource.
+        Responses with status 401, 403, 404, 408, 409, 429, 500, 502, 503 or 504 are
+        not stored. Generate a fresh key for each logically distinct operation.
+      schema:
+        type: string
+        format: uuid
+        example: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+
+    PaymentID:
+      name: paymentId
+      in: path
+      required: true
+      description: Unique identifier of the payment (UUID).
+      schema:
+        type: string
+        format: uuid
+        example: "019327c6-2058-7901-b234-56789abcdeff"
+
+  # ---------------------------------------------------------------------------
+  # Reusable responses
+  # ---------------------------------------------------------------------------
+  responses:
+    Unauthorized:
+      description: Authentication failed — token is missing, invalid, or expired.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            auth_missing:
+              summary: Authorization header is missing
+              value:
+                error:
+                  type: "authentication_error"
+                  message: "Missing authorization token"
+                  code: "auth_missing"
+            auth_bearer_missing:
+              summary: Authorization header does not use the Bearer scheme
+              value:
+                error:
+                  type: "authentication_error"
+                  message: "Authorization header must use Bearer scheme"
+                  code: "auth_bearer_missing"
+            auth_invalid:
+              summary: Token is invalid or expired
+              value:
+                error:
+                  type: "authentication_error"
+                  message: "Invalid authentication token"
+                  code: "auth_invalid"
+
+    InvalidPaymentID:
+      description: The provided paymentId is not a valid UUID.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: "invalid_request_error"
+              message: "paymentId must be a valid UUID"
+              code: "invalid_payment_id"
+              param: "paymentId"
+
+    PaymentNotFound:
+      description: Payment not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: "not_found_error"
+              message: "Payment not found"
+              code: "payment_not_found"
+
+    InternalError:
+      description: An unexpected internal server error occurred.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              type: "api_error"
+              message: "Internal server error"
+              code: "internal_error"
+
+  # ---------------------------------------------------------------------------
+  # Schemas
+  # ---------------------------------------------------------------------------
+  schemas:
+    # =========================================================================
+    # Error model
+    # =========================================================================
+    ErrorResponse:
+      type: object
+      description: |
+        Top-level error envelope returned for all non-2xx responses. All error
+        information is nested under the `error` key to allow safe envelope detection
+        without inspecting the HTTP status code.
+      properties:
+        error:
+          $ref: "#/components/schemas/Error"
+      required:
+        - error
+
+    Error:
+      type: object
+      description: |
+        Structured error object. `type` gives the broad category, `code` is the
+        machine-readable discriminator for programmatic handling, `message` is a
+        human-readable explanation, and the optional `param` names the specific
+        request field that caused the error.
+      properties:
+        type:
+          type: string
+          description: |
+            High-level error category. Use this to determine the general class of
+            the error without parsing `code`.
+          enum:
+            - invalid_request_error
+            - authentication_error
+            - not_found_error
+            - rate_limit_error
+            - api_error
+          example: "invalid_request_error"
+        message:
+          type: string
+          description: Human-readable description of the error, intended for developers.
+          maxLength: 512
+          example: "Invalid amount (must be a valid positive number)"
+        code:
+          type: string
+          description: |
+            Machine-readable error identifier. Use this in conditional logic to branch
+            on specific error conditions (e.g., retry on `payment_concurrent_limit_exceeded`,
+            surface to user on `payment_not_cancellable`).
+          example: "invalid_amount"
+        param:
+          type: string
+          description: |
+            The name of the request field that caused the error, using dot notation
+            for nested fields (e.g., `currency`, `paymentOptions.methods`).
+            Present only when the error is attributable to a specific parameter.
+          example: "amount"
+      required:
+        - type
+        - message
+        - code
+
+    # =========================================================================
+    # Create Payment — request schema (flat)
+    # =========================================================================
+    CreatePaymentRequest:
+      type: object
+      description: |
+        Request body for creating a new payment. The body is intentionally flat:
+        `amount`, `currency`, and all optional fields are top-level. The only nested
+        structure is `paymentOptions.methods`, which restricts the payment methods
+        offered to the customer.
+      required:
+        - amount
+        - currency
+      properties:
+        amount:
+          type: string
+          description: |
+            The payment value as a positive decimal string. Zero is not allowed.
+            No leading zeros are permitted on the integer part (`"007"` is invalid; use `"7"`).
+            For fiat currencies up to 2 decimal places are recommended.
+            For crypto tickers precision depends on the coin.
+          pattern: '^(0\.\d*[1-9]\d*|[1-9]\d*(\.\d+)?)$'
+          example: "100.00"
+        currency:
+          type: string
+          description: |
+            Ticker symbol for the denomination. Accepts fiat codes (`USD`, `EUR`, `RUB`)
+            or TON-ecosystem coin tickers (`TON`, `USDT`, `NOT`, `DOGS`, `BUILD`, `BLUM`,
+            `DUST`, `DYOR`, `STON`, `XAUt0`).
+
+            This field defines the **unit of value** — it does not determine the coin
+            the customer pays with. Payment coin is controlled by `paymentOptions.methods`.
+
+            Any supported ticker is accepted, regardless of which payment methods are
+            enabled for your store.
+          example: "USD"
+        paymentOptions:
+          $ref: "#/components/schemas/PaymentOptions"
+        ttl:
+          type: integer
+          format: int64
+          description: |
+            Time-to-live in seconds. Defines how long the payment remains active
+            from the moment of creation. Once the TTL elapses the payment moves to
+            `expired` status — this can happen from either `created` or `pending`.
+
+            Minimum: `900` (15 minutes). Maximum: `43200` (12 hours).
+            Defaults to `3600` (1 hour) if not specified.
+          minimum: 900
+          maximum: 43200
+          default: 3600
+          example: 3600
+        orderId:
+          type: string
+          maxLength: 128
+          description: |
+            Merchant-defined external order identifier. Use this to correlate a HexPay
+            payment with your internal order or invoice system. Returned on all payment
+            objects and included in the webhook payload.
+          example: "order-2026-00123"
+        description:
+          type: string
+          maxLength: 512
+          description: |
+            Human-readable description of the payment purpose. May be displayed to
+            the customer on the payment page.
+          example: "Premium subscription — 1 year"
+        metadata:
+          type: object
+          description: |
+            Arbitrary key-value pairs for merchant use. All values must be strings.
+            Returned on all payment objects and included in the webhook payload.
+            Maximum 10 keys; key names up to 64 characters, values up to 512 characters.
+            Keys are stored as provided and are not renamed.
+          maxProperties: 10
+          additionalProperties:
+            type: string
+            maxLength: 512
+          example:
+            customer_id: "cust_abc123"
+            customer_email: "customer@example.com"
+        webhookUrl:
+          type: string
+          format: uri
+          pattern: '^https://'
+          maxLength: 512
+          description: |
+            HTTPS URL to which HexPay will POST a webhook notification when this
+            payment reaches `completed` status. No webhooks are sent for other statuses.
+
+            Requirements:
+            - Must use HTTPS. Plain HTTP URLs are rejected.
+            - Must be publicly reachable from the internet. Non-public addresses are
+              rejected, and host names that resolve to them are blocked at delivery time.
+            - Make sure your server is configured to accept POST requests at this URL
+              before creating payments.
+          example: "https://merchant.com/webhooks/hexpay"
+        redirectUrl:
+          type: string
+          format: uri
+          pattern: '^https://'
+          maxLength: 512
+          description: |
+            HTTPS URL of your page (e.g. the order page) that the checkout page links to
+            once the payment is finished (`completed`, `expired` or `cancelled`), so the
+            customer can return to your store.
+
+            Requirements:
+            - Must be an absolute HTTPS URL. Plain HTTP and other schemes are rejected.
+            - Maximum 512 characters.
+
+            If omitted, the checkout page uses the default HexPay URL.
+          example: "https://merchant.com/orders/order-2026-00123"
+
+    # =========================================================================
+    # Payment Options & Method restriction
+    # =========================================================================
+    PaymentOptions:
+      type: object
+      description: |
+        Optional restriction on which payment methods are offered at checkout.
+        When omitted entirely, all payment methods enabled for your store are shown
+        and the payment is created in `created` status.
+      properties:
+        methods:
+          type: array
+          description: |
+            Payment methods the customer is allowed to pay with.
+
+            Currently exactly one entry with both `coin` and `chain` is supported.
+            HexPay then selects this method on behalf of the customer: the payment is
+            created directly in `pending` status with `paymentDetails` populated
+            (Preselected). Allowing several methods is planned.
+
+            Omit `paymentOptions` entirely to let the customer select a payment method
+            at checkout — payment starts in `created` status (Customer Choice).
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: "#/components/schemas/MethodRestriction"
+
+    MethodRestriction:
+      type: object
+      description: |
+        A payment method allowed for this payment, identified by coin and chain.
+        Both `coin` and `chain` are required.
+
+        Use the exact `symbol` values returned by `GET /v1/payment-methods`.
+        Values are case-sensitive.
+      required:
+        - coin
+        - chain
+      properties:
+        coin:
+          type: string
+          description: Coin ticker. Must be a coin supported by HexPay on TON.
+          enum:
+            - BUILD
+            - BLUM
+            - DOGS
+            - DUST
+            - DYOR
+            - NOT
+            - STON
+            - TON
+            - USDT
+            - XAUt0
+          example: "USDT"
+        chain:
+          type: string
+          description: Chain ticker. Currently only `TON` is supported.
+          enum:
+            - TON
+          example: "TON"
+
+    # =========================================================================
+    # Payment status (shared enum)
+    # =========================================================================
+    PaymentStatus:
+      type: string
+      description: |
+        Lifecycle status of a payment:
+        - `created`   — Payment created; customer has not yet selected a payment method.
+          `paymentDetails` is absent.
+        - `pending`   — Method confirmed; `paymentDetails` populated with the blockchain
+          address and exact coin amount. Awaiting on-chain transfer.
+        - `completed` — On-chain transfer confirmed. `transactionSignatures` are present.
+        - `expired`   — Payment TTL elapsed without a confirmed transfer. Reachable from
+          **both** `created` (customer never selected a method) and `pending` (customer
+          selected but did not send the transfer in time).
+        - `cancelled` — Canceled by the merchant via `POST /v1/payments/{paymentId}/cancel`.
+          Reachable from both `created` and `pending`.
+      enum:
+        - created
+        - pending
+        - completed
+        - expired
+        - cancelled
+      example: "created"
+
+    PaymentStatusResponse:
+      type: object
+      description: |
+        Lightweight response containing only the current status of a payment.
+        Use `GET /v1/payments/{paymentId}` when you also need the address,
+        amount, or timer details.
+      properties:
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+      required:
+        - status
+
+    PaymentCancelResponse:
+      type: object
+      description: |
+        Result of a cancellation. Contains only the new status, always `cancelled`.
+      properties:
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+      required:
+        - status
+
+    # =========================================================================
+    # Payment list
+    # =========================================================================
+    PaymentListResponse:
+      type: object
+      description: Paginated list of payments with cursor-based navigation metadata.
+      properties:
+        data:
+          type: array
+          description: Array of payment objects for the current page.
+          items:
+            $ref: "#/components/schemas/PaymentResponse"
+        cursor:
+          type: string
+          description: |
+            Opaque pagination cursor. Present only when there are more pages of results.
+            Pass this value unchanged as the `cursor` query parameter to retrieve the
+            next page. When absent, the current page is the last one.
+          example: "019327c6-1234-7901-b234-56789abcde00"
+      required:
+        - data
+
+    # =========================================================================
+    # Full payment object
+    # =========================================================================
+    PaymentResponse:
+      type: object
+      description: |
+        Full payment object. Returned by the create, retrieve, and list endpoints.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique payment identifier.
+          example: "019327c6-2058-7901-b234-56789abcdeff"
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+        amount:
+          type: string
+          description: |
+            The denomination amount recorded at creation time. Mirrors the `amount`
+            field from the create request.
+          pattern: '^(0\.\d*[1-9]\d*|[1-9]\d*(\.\d+)?)$'
+          example: "100.00"
+        currency:
+          type: string
+          description: |
+            The denomination currency ticker recorded at creation time. Mirrors the
+            `currency` field from the create request. May be a fiat code or a coin ticker.
+          example: "USD"
+        paymentDetails:
+          $ref: "#/components/schemas/PaymentDetails"
+        checkoutUrl:
+          type: string
+          format: uri
+          description: |
+            URL of the HexPay-hosted checkout page for this payment. Redirect the
+            customer to this URL to let them complete the payment.
+          example: "https://payment.hexpay.io/019327c6-2058-7901-b234-56789abcdeff"
+        orderId:
+          type: string
+          maxLength: 128
+          description: Merchant-defined external order identifier, if provided at creation.
+          example: "order-2026-00123"
+        description:
+          type: string
+          maxLength: 512
+          description: Payment description, if provided at creation.
+          example: "Premium subscription — 1 year"
+        metadata:
+          type: object
+          description: |
+            Key-value pairs provided at creation time, if any.
+          additionalProperties:
+            type: string
+          example:
+            customer_id: "cust_abc123"
+        timer:
+          $ref: "#/components/schemas/PaymentTimerResponse"
+      required:
+        - id
+        - status
+        - amount
+        - currency
+        - timer
+        - checkoutUrl
+
+    # =========================================================================
+    # Payment sub-objects
+    # =========================================================================
+    PaymentTimerResponse:
+      type: object
+      description: |
+        Lifecycle timing information for the payment.
+      properties:
+        createdAt:
+          type: string
+          format: date-time
+          description: Payment creation timestamp in RFC 3339 format (UTC).
+          example: "2026-01-20T10:00:00Z"
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            Timestamp (RFC 3339, UTC) at which the payment automatically moves to
+            `expired` status. Subtract `createdAt` to derive the total TTL window.
+          example: "2026-01-20T11:00:00Z"
+        paidAt:
+          type: string
+          format: date-time
+          description: |
+            Timestamp (RFC 3339, UTC) at which the payment has been paid.
+            Present only when status is `completed`.
+          example: "2026-01-20T10:12:00Z"
+      required:
+        - createdAt
+        - expiresAt
+
+    PaymentDetails:
+      type: object
+      description: |
+        Cryptocurrency payment instructions. Absent while status is `created`.
+        Populated when the payment transitions to `pending` — either because the
+        customer selected a method, or because a single exact method was
+        preselected at creation. Kept for `completed`, and for `expired` and
+        `cancelled` payments that had reached `pending`.
+
+        The customer must send exactly `coinAmount` of `coin` to `address` on the
+        TON blockchain.
+      properties:
+        address:
+          type: string
+          description: TON blockchain address the customer must send the cryptocurrency to.
+          example: "UQBf_DO8wsBddOcMnGEOyREEHPPKMBL2F26GQFOV7FQdYY_a"
+        coinAmount:
+          type: string
+          description: |
+            Exact cryptocurrency amount the customer must transfer. Sending less
+            than this amount will result in an underpayment.
+          pattern: '^(0\.\d*[1-9]\d*|[1-9]\d*(\.\d+)?)$'
+          example: "100.04"
+        coin:
+          $ref: "#/components/schemas/CoinResponse"
+        chain:
+          $ref: "#/components/schemas/ChainResponse"
+        transactionSignatures:
+          type: array
+          description: |
+            On-chain transaction hash(es) confirming the payment.
+            Present only when status is `completed`.
+          items:
+            type: string
+          example:
+            - "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      required:
+        - address
+        - coinAmount
+        - coin
+        - chain
+
+    # =========================================================================
+    # Shared coin / chain objects
+    # =========================================================================
+    CoinResponse:
+      type: object
+      description: Cryptocurrency (coin) metadata.
+      properties:
+        name:
+          type: string
+          description: Human-readable name of the cryptocurrency.
+          example: "Tether"
+        symbol:
+          type: string
+          description: |
+            Ticker symbol. Use this value as the `coin` field in
+            `paymentOptions.methods` when creating payments.
+          enum:
+            - BUILD
+            - BLUM
+            - DOGS
+            - DUST
+            - DYOR
+            - NOT
+            - STON
+            - TON
+            - USDT
+            - XAUt0
+          example: "USDT"
+        imgUrl:
+          type: string
+          format: uri
+          description: URL of the coin logo image.
+          example: "https://assets.hexpay.io/coins/usdt.svg"
+      required:
+        - name
+        - symbol
+        - imgUrl
+
+    ChainResponse:
+      type: object
+      description: Blockchain network metadata. Currently only TON is supported.
+      properties:
+        name:
+          type: string
+          description: Human-readable name of the blockchain network.
+          example: "TON"
+        symbol:
+          type: string
+          description: |
+            Ticker symbol. Use this value as the `chain` field in
+            `paymentOptions.methods` when creating payments.
+          enum:
+            - TON
+          example: "TON"
+        imgUrl:
+          type: string
+          format: uri
+          description: URL of the chain logo image.
+          example: "https://assets.hexpay.io/chains/ton.svg"
+      required:
+        - name
+        - symbol
+        - imgUrl
+
+    # =========================================================================
+    # Payment methods
+    # =========================================================================
+    PaymentMethodListResponse:
+      type: object
+      description: |
+        Payment methods currently enabled for your store, wrapped in a consistent
+        data envelope. Use `coin.symbol` and `chain.symbol` from each entry in
+        `paymentOptions.methods` when creating payments.
+      properties:
+        data:
+          type: array
+          description: Array of enabled payment method objects.
+          items:
+            $ref: "#/components/schemas/PaymentMethodResponse"
+      required:
+        - data
+
+    PaymentMethodResponse:
+      type: object
+      description: |
+        A single payment method — a coin + chain combination accepted by the store.
+        The `coin.symbol` / `chain.symbol` pair uniquely identifies the method for
+        use in `paymentOptions.methods`.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier for this payment method configuration.
+          example: "0197ef69-6825-7bb4-8cd8-770ab407e240"
+        coin:
+          $ref: "#/components/schemas/CoinResponse"
+        chain:
+          $ref: "#/components/schemas/ChainResponse"
+      required:
+        - id
+        - coin
+        - chain
+
+    # =========================================================================
+    # Webhook (sent by HexPay to webhookUrl)
+    # =========================================================================
+    WebhookRequest:
+      type: object
+      description: |
+        Body of the webhook HexPay POSTs to `webhookUrl` when a payment reaches
+        `completed`. Signed with Ed25519; the signature is in the `X-Signature`
+        header and the key ID in `X-Signature-Kid`.
+      properties:
+        payload:
+          $ref: "#/components/schemas/WebhookPayload"
+        signAt:
+          type: string
+          format: date-time
+          description: Signing timestamp (RFC 3339, UTC).
+          example: "2026-01-20T10:12:00Z"
+      required:
+        - payload
+        - signAt
+
+    WebhookPayload:
+      type: object
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Payment identifier.
+          example: "019327c6-2058-7901-b234-56789abcdeff"
+        status:
+          type: string
+          description: Payment status. Always `completed`.
+          enum:
+            - completed
+          example: "completed"
+        orderId:
+          type: string
+          nullable: true
+          description: Merchant order identifier from the create request, or `null`.
+          example: "order-2026-00123"
+        metadata:
+          type: object
+          nullable: true
+          description: Metadata from the create request, or `null`.
+          additionalProperties:
+            type: string
+          example:
+            customer_id: "cust_abc123"
+      required:
+        - paymentId
+        - status
+        - orderId
+        - metadata
